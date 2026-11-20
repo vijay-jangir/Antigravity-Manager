@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 // Google OAuth configuration
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "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";
+const GCP_CLIENT_ID: &str =
+    "884354919052-36trc1jjb3tguiac32ov6cod268c5blh.apps.googleusercontent.com";
+const GCP_CLIENT_SECRET: &str = "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";
+pub const GCP_OAUTH_CLIENT_KEY: &str = "antigravity_gcp";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
@@ -88,13 +92,22 @@ fn normalize_client_key(key: &str) -> String {
 }
 
 fn build_registry() -> OAuthClientRegistry {
-    let mut clients: Vec<OAuthClientConfig> = vec![OAuthClientConfig {
-        key: normalize_client_key(DEFAULT_OAUTH_CLIENT_KEY),
-        label: "Antigravity Enterprise".to_string(),
-        client_id: CLIENT_ID.to_string(),
-        client_secret: CLIENT_SECRET.to_string(),
-        is_builtin: true,
-    }];
+    let mut clients: Vec<OAuthClientConfig> = vec![
+        OAuthClientConfig {
+            key: normalize_client_key(DEFAULT_OAUTH_CLIENT_KEY),
+            label: "Antigravity Enterprise".to_string(),
+            client_id: CLIENT_ID.to_string(),
+            client_secret: CLIENT_SECRET.to_string(),
+            is_builtin: true,
+        },
+        OAuthClientConfig {
+            key: normalize_client_key(GCP_OAUTH_CLIENT_KEY),
+            label: "Antigravity GCP".to_string(),
+            client_id: GCP_CLIENT_ID.to_string(),
+            client_secret: GCP_CLIENT_SECRET.to_string(),
+            is_builtin: true,
+        },
+    ];
 
     if let Ok(raw_extra_clients) = std::env::var(OAUTH_CLIENTS_ENV) {
         for entry in raw_extra_clients.split(';') {
@@ -720,10 +733,22 @@ pub async fn ensure_fresh_token(
         "Token expiring soon for account {:?}, refreshing...",
         account_id
     ));
+    let preferred_client = current_token.oauth_client_key.as_deref().or_else(|| {
+        if current_token.is_gcp_tos
+            && current_token
+                .project_id
+                .as_ref()
+                .map_or(false, |p| !p.trim().is_empty())
+        {
+            Some(GCP_OAUTH_CLIENT_KEY)
+        } else {
+            None
+        }
+    });
     let response = refresh_access_token_with_client(
         &current_token.refresh_token,
         account_id,
-        current_token.oauth_client_key.as_deref(),
+        preferred_client,
     )
     .await?;
 
@@ -741,7 +766,8 @@ pub async fn ensure_fresh_token(
         current_token.is_gcp_tos,
         response.id_token.or(current_token.id_token.clone()), // Use new id_token or keep old one
     )
-    .with_oauth_client_key(oauth_client_key))
+    .with_oauth_client_key(oauth_client_key)
+    .with_region(current_token.region.clone()))
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ pub struct ImportedOAuthState {
     pub refresh_token: String,
     pub is_gcp_tos: bool,
     pub project_id: Option<String>,
+    pub region: Option<String>,
 }
 
 /// Scan and import V1 data
@@ -256,7 +257,13 @@ pub async fn import_from_custom_db_path(path_str: String) -> Result<Account, Str
 
     // 3. Use Refresh Token to get latest Access Token and user info
     crate::modules::logger::log_info("Getting user info using Refresh Token...");
-    let token_resp = oauth::refresh_access_token(&refresh_token, None).await?;
+    let preferred_client = if oauth_state.is_gcp_tos {
+        Some(oauth::GCP_OAUTH_CLIENT_KEY)
+    } else {
+        None
+    };
+    let token_resp =
+        oauth::refresh_access_token_with_client(&refresh_token, None, preferred_client).await?;
     let user_info = oauth::get_user_info(&token_resp.access_token, None).await?;
 
     let email = user_info.email;
@@ -273,7 +280,8 @@ pub async fn import_from_custom_db_path(path_str: String) -> Result<Account, Str
         oauth_state.is_gcp_tos,
         token_resp.id_token,
     )
-    .with_oauth_client_key(token_resp.oauth_client_key);
+    .with_oauth_client_key(token_resp.oauth_client_key)
+    .with_region(oauth_state.region);
     // 4. Add or update account
     account::upsert_account(email.clone(), user_info.name, token_data)
 }
@@ -284,6 +292,7 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
 
     let mut imported_accounts = Vec::new();
     let mut seen_refresh_tokens = std::collections::HashSet::new();
+    let mut seen_emails = std::collections::HashSet::new();
 
     // 1. 系统 Keyring / Keychain（仅在未指定目标或显式为经典款时探测，避免影响单纯 IDE 导入）
     if target_ide != Some("ide") {
@@ -293,25 +302,36 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
                 crate::modules::logger::log_info(
                     "Discovered OAuth state in System Keyring/Keychain",
                 );
-                if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
+                let preferred_client = if oauth_state.is_gcp_tos {
+                    Some(oauth::GCP_OAUTH_CLIENT_KEY)
+                } else {
+                    None
+                };
+                if let Ok(token_resp) =
+                    oauth::refresh_access_token_with_client(&refresh_token, None, preferred_client)
+                        .await
+                {
                     let email = match oauth::get_user_info(&token_resp.access_token, None).await {
                         Ok(info) => info.email,
                         Err(_) => "Unknown".to_string(),
                     };
-                    let token_data = TokenData::new(
-                        token_resp.access_token,
-                        refresh_token,
-                        token_resp.expires_in,
-                        Some(email.clone()),
-                        oauth_state.project_id,
-                        None,
-                        oauth_state.is_gcp_tos,
-                        token_resp.id_token,
-                    )
-                    .with_oauth_client_key(token_resp.oauth_client_key);
+                    if seen_emails.insert(email.trim().to_lowercase()) {
+                        let token_data = TokenData::new(
+                            token_resp.access_token,
+                            refresh_token,
+                            token_resp.expires_in,
+                            Some(email.clone()),
+                            oauth_state.project_id,
+                            None,
+                            oauth_state.is_gcp_tos,
+                            token_resp.id_token,
+                        )
+                        .with_oauth_client_key(token_resp.oauth_client_key)
+                        .with_region(oauth_state.region);
 
-                    if let Ok(acc) = account::upsert_account(email, None, token_data) {
-                        imported_accounts.push(acc);
+                        if let Ok(acc) = account::upsert_account(email, None, token_data) {
+                            imported_accounts.push(acc);
+                        }
                     }
                 }
             }
@@ -325,25 +345,36 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
             crate::modules::logger::log_info(
                 "Discovered OAuth state in Antigravity CLI credentials",
             );
-            if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
+            let preferred_client = if oauth_state.is_gcp_tos {
+                Some(oauth::GCP_OAUTH_CLIENT_KEY)
+            } else {
+                None
+            };
+            if let Ok(token_resp) =
+                oauth::refresh_access_token_with_client(&refresh_token, None, preferred_client)
+                    .await
+            {
                 let email = match oauth::get_user_info(&token_resp.access_token, None).await {
                     Ok(info) => info.email,
                     Err(_) => "Unknown".to_string(),
                 };
-                let token_data = TokenData::new(
-                    token_resp.access_token,
-                    refresh_token,
-                    token_resp.expires_in,
-                    Some(email.clone()),
-                    oauth_state.project_id,
-                    None,
-                    oauth_state.is_gcp_tos,
-                    token_resp.id_token,
-                )
-                .with_oauth_client_key(token_resp.oauth_client_key);
+                if seen_emails.insert(email.trim().to_lowercase()) {
+                    let token_data = TokenData::new(
+                        token_resp.access_token,
+                        refresh_token,
+                        token_resp.expires_in,
+                        Some(email.clone()),
+                        oauth_state.project_id,
+                        None,
+                        oauth_state.is_gcp_tos,
+                        token_resp.id_token,
+                    )
+                    .with_oauth_client_key(token_resp.oauth_client_key)
+                    .with_region(oauth_state.region);
 
-                if let Ok(acc) = account::upsert_account(email, None, token_data) {
-                    imported_accounts.push(acc);
+                    if let Ok(acc) = account::upsert_account(email, None, token_data) {
+                        imported_accounts.push(acc);
+                    }
                 }
             }
         }
@@ -365,27 +396,40 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
                         "Discovered OAuth state in Antigravity DB path: {:?}",
                         db_path
                     ));
-                    if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await
+                    let preferred_client = if oauth_state.is_gcp_tos {
+                        Some(oauth::GCP_OAUTH_CLIENT_KEY)
+                    } else {
+                        None
+                    };
+                    if let Ok(token_resp) = oauth::refresh_access_token_with_client(
+                        &refresh_token,
+                        None,
+                        preferred_client,
+                    )
+                    .await
                     {
                         let email = match oauth::get_user_info(&token_resp.access_token, None).await
                         {
                             Ok(info) => info.email,
                             Err(_) => "Unknown".to_string(),
                         };
-                        let token_data = TokenData::new(
-                            token_resp.access_token,
-                            refresh_token,
-                            token_resp.expires_in,
-                            Some(email.clone()),
-                            oauth_state.project_id,
-                            None,
-                            oauth_state.is_gcp_tos,
-                            token_resp.id_token,
-                        )
-                        .with_oauth_client_key(token_resp.oauth_client_key);
+                        if seen_emails.insert(email.trim().to_lowercase()) {
+                            let token_data = TokenData::new(
+                                token_resp.access_token,
+                                refresh_token,
+                                token_resp.expires_in,
+                                Some(email.clone()),
+                                oauth_state.project_id,
+                                None,
+                                oauth_state.is_gcp_tos,
+                                token_resp.id_token,
+                            )
+                            .with_oauth_client_key(token_resp.oauth_client_key)
+                            .with_region(oauth_state.region);
 
-                        if let Ok(acc) = account::upsert_account(email, None, token_data) {
-                            imported_accounts.push(acc);
+                            if let Ok(acc) = account::upsert_account(email, None, token_data) {
+                                imported_accounts.push(acc);
+                            }
                         }
                     }
                 }
@@ -491,13 +535,18 @@ pub fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthS
 
         let refresh_token = String::from_utf8(refresh_bytes)
             .map_err(|_| "Refresh Token is not UTF-8 encoded".to_string())?;
-        let is_gcp_tos = protobuf::find_varint_field(&oauth_info_blob, 6)?.unwrap_or(1) != 0;
-        let project_id = extract_enterprise_project_id_from_conn(&conn)?;
+        let is_gcp_tos = protobuf::find_varint_field(&oauth_info_blob, 6)?.unwrap_or(0) != 0;
+        let project_id = if is_gcp_tos {
+            extract_enterprise_project_id_from_conn(&conn)?
+        } else {
+            None
+        };
 
         return Ok(ImportedOAuthState {
             refresh_token,
             is_gcp_tos,
             project_id,
+            region: None,
         });
     }
 
@@ -535,34 +584,35 @@ pub fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthS
         refresh_token,
         is_gcp_tos: true,
         project_id: extract_enterprise_project_id_from_conn(&conn)?,
+        region: None,
     })
 }
 
-/// Get current Refresh Token from System Keyring or candidate databases
-pub fn get_refresh_token_from_db(target_ide: Option<&str>) -> Result<String, String> {
+/// Get current OAuth state from System Keyring or candidate databases
+pub fn get_oauth_state_from_db(target_ide: Option<&str>) -> Result<ImportedOAuthState, String> {
     use crate::modules::integration;
 
-    // 严禁对 IDE 目标查询系统 Keyring：
-    // 系统 Keyring（如 Keychain/Secret Service）专属于原生桌面端 (>= 2.0.0) 或 CLI (agy)，
-    // 基于 VS Code 架构的 Antigravity IDE 凭据严格存储在 state.vscdb 中。
-    // 如果 target_ide == Some("ide")，必须直接从 IDE 数据库候选路径读取，
-    // 否则后台自动同步任务会从 Keyring 读取到经典版账号，误判后逆向覆盖 IDE 的当前账号！
     if target_ide != Some("ide") {
         if let Ok(oauth_state) = integration::read_from_system_keyring() {
-            return Ok(oauth_state.refresh_token);
+            return Ok(oauth_state);
         }
     }
 
     let candidate_paths = db::get_all_candidate_db_paths(target_ide);
     for db_path in candidate_paths {
         if db_path.exists() {
-            if let Ok(token) = extract_refresh_token_from_file(&db_path) {
-                return Ok(token);
+            if let Ok(state) = extract_oauth_state_from_file(&db_path) {
+                return Ok(state);
             }
         }
     }
 
     Err("Login state data not found in keyring or any database format".to_string())
+}
+
+/// Get current Refresh Token from System Keyring or candidate databases
+pub fn get_refresh_token_from_db(target_ide: Option<&str>) -> Result<String, String> {
+    get_oauth_state_from_db(target_ide).map(|s| s.refresh_token)
 }
 
 #[cfg(test)]

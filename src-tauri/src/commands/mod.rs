@@ -834,26 +834,44 @@ pub async fn sync_account_from_db(
     // 1. Read the credential source used by the selected client. For agy, do
     // not mistake an older file credential for the active keyring account.
     let credential = if is_agy {
-        modules::integration::read_from_system_keyring_only().map(|state| state.refresh_token)
+        modules::integration::read_from_system_keyring_only()
     } else {
-        modules::migration::get_refresh_token_from_db(current_target)
+        modules::migration::get_oauth_state_from_db(current_target)
     };
-    let db_refresh_token = match credential {
-        Ok(token) => token,
+    let db_state = match credential {
+        Ok(state) => state,
         Err(e) => {
             modules::logger::log_info(&format!("自动同步跳过: {}", e));
             return Ok(None);
         }
     };
+    let db_refresh_token = db_state.refresh_token;
 
     // 2. 获取 Manager 当前账号
     let curr_account = modules::account::get_current_account()?;
 
-    // 3. 对比：如果 Refresh Token 相同，说明账号没变，无需导入
-    if let Some(acc) = curr_account {
+    // 3. 对比：如果 Refresh Token 相同，说明账号没变，仅在 GCP 项目信息变更时同步
+    if let Some(mut acc) = curr_account {
         if acc.token.refresh_token == db_refresh_token {
-            // 账号未变，由于已经是周期性任务，我们可以选择性刷新一下配额，或者直接返回
-            // 这里为了节省 API 流量，直接返回
+            let project_changed =
+                db_state.project_id.is_some() && db_state.project_id != acc.token.project_id;
+            let gcp_tos_changed = db_state.is_gcp_tos && !acc.token.is_gcp_tos;
+            if project_changed || gcp_tos_changed {
+                if db_state.project_id.is_some() {
+                    acc.token.project_id = db_state.project_id;
+                }
+                if db_state.is_gcp_tos {
+                    acc.token.is_gcp_tos = true;
+                }
+                if db_state.region.is_some() {
+                    acc.token.region = db_state.region;
+                }
+                modules::account::save_account(&acc)?;
+                let _ = internal_refresh_account_quota(&app, &mut acc).await;
+                crate::modules::tray::update_tray_menus(&app);
+                let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+                return Ok(Some(acc));
+            }
             return Ok(None);
         }
         modules::logger::log_info(&format!("检测到登录凭据变化 ({})，正在同步...", acc.email));

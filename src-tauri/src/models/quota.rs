@@ -251,8 +251,13 @@ pub fn normalize_subscription_tier(tier: &str) -> String {
         return "FREE".to_string();
     }
 
-    // 3) 付费档：g1-pro-tier / "Google AI Pro" / premium / advanced
-    if lower.contains("pro") || lower.contains("premium") || lower.contains("advanced") {
+    // 3) 付费档 / 企业 GCP PayGo 档：g1-pro-tier / "Google AI Pro" / premium / advanced / gcp-ge-standard-tier / enterprise
+    if lower.contains("pro")
+        || lower.contains("premium")
+        || lower.contains("advanced")
+        || lower.contains("gcp")
+        || lower.contains("enterprise")
+    {
         return "PRO".to_string();
     }
 

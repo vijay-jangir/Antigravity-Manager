@@ -116,6 +116,8 @@ struct LoadProjectResponse {
     allowed_tiers: Option<Vec<Tier>>,
     #[serde(rename = "ineligibleTiers")]
     ineligible_tiers: Option<Vec<IneligibleTier>>,
+    #[serde(rename = "gcpManaged")]
+    gcp_managed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +130,7 @@ struct IneligibleTier {
 #[derive(Debug, Deserialize)]
 struct Tier {
     #[allow(dead_code)]
+    #[serde(rename = "isDefault")]
     is_default: Option<bool>,
     id: Option<String>,
     #[allow(dead_code)]
@@ -136,6 +139,8 @@ struct Tier {
     name: Option<String>,
     #[allow(dead_code)]
     slug: Option<String>,
+    #[serde(rename = "usesGcpTos")]
+    uses_gcp_tos: Option<bool>,
 }
 
 /// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
@@ -228,11 +233,23 @@ async fn fetch_project_id(
                             })
                             .unwrap_or_else(|| "free-tier".to_string());
 
+                        let is_gcp_managed = data.gcp_managed == Some(true)
+                            || data
+                                .allowed_tiers
+                                .as_ref()
+                                .map_or(false, |tiers| {
+                                    tiers
+                                        .iter()
+                                        .any(|t| t.uses_gcp_tos == Some(true))
+                                });
+
                         let subscription_tier = {
                             let normalized =
                                 crate::models::quota::normalize_subscription_tier(&raw_tier);
                             if crate::models::quota::is_known_tier(&normalized) {
                                 Some(normalized)
+                            } else if is_gcp_managed {
+                                Some("PRO".to_string())
                             } else {
                                 // standard-tier 或其他未知档位安全归入 FREE
                                 Some("FREE".to_string())
@@ -312,12 +329,49 @@ pub async fn fetch_quota_with_cache(
     // 这个「优化」只剩副作用，因此移除。
     //
     // 现在：始终调用；仅在上游返回空值时用缓存/已存值兜底，避免网络抖动把数据抹掉。
-    let (fresh_project_id, fresh_tier) = fetch_project_id(access_token, email, account_id).await;
+    let account_record = account_id.and_then(|id| crate::modules::load_account(id).ok());
+    let configured_gcp_project = account_record
+        .as_ref()
+        .and_then(|acc| acc.token.project_id.clone())
+        .or_else(|| cached_project_id.map(|s| s.to_string()))
+        .filter(|p| !p.trim().is_empty());
+    let is_gcp_paygo = account_record
+        .as_ref()
+        .map(|acc| {
+            acc.token.is_gcp_tos
+                || acc.token.oauth_client_key.as_deref()
+                    == Some(crate::modules::oauth::GCP_OAUTH_CLIENT_KEY)
+        })
+        .unwrap_or(false)
+        && configured_gcp_project.is_some();
+    let gcp_region = account_record
+        .as_ref()
+        .and_then(|acc| acc.token.region.clone())
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "global".to_string());
+
+    // 对于 Enterprise GCP PayGo 账号（is_gcp_tos = true 且配置了 GCP project_id）：
+    // 对齐官方 Antigravity >= 2.28.2 (`codeassistclient.fetchLoadCodeAssistResponse` 的 `IsBusinessPayGo` 分支)，
+    // 不调用个人消费版 `v1internal:loadCodeAssist`（否则会被错误降级为 free-tier 并覆盖用户配置的 GCP project_id），
+    // 直接合成权威等级 `gcp-ge-standard-tier` (PRO) 并保留用户指定的 GCP 项目与区域。
+    let (fresh_project_id, fresh_tier) = if is_gcp_paygo {
+        crate::modules::logger::log_info(&format!(
+            "📊 [{}] Enterprise GCP PayGo account identified (project: {}, location: {}) -> PRO",
+            email,
+            configured_gcp_project.as_deref().unwrap_or(""),
+            gcp_region
+        ));
+        (
+            configured_gcp_project.clone(),
+            Some("PRO".to_string()),
+        )
+    } else {
+        fetch_project_id(access_token, email, account_id).await
+    };
 
     let project_id = fresh_project_id.or_else(|| cached_project_id.map(|s| s.to_string()));
 
-    let existing_tier = account_id
-        .and_then(|id| crate::modules::load_account(id).ok())
+    let existing_tier = account_record
         .and_then(|acc| acc.quota.and_then(|q| q.subscription_tier));
 
     // 上游值优先；上游这次没给（网络失败 / 未识别）才保留旧值。
@@ -327,7 +381,11 @@ pub async fn fetch_quota_with_cache(
 
     let client = create_standard_client(account_id).await;
     let payload = if let Some(ref pid) = project_id {
-        json!({ "project": pid })
+        if is_gcp_paygo {
+            json!({ "project": pid, "location": gcp_region })
+        } else {
+            json!({ "project": pid })
+        }
     } else {
         json!({}) // Empty payload fallback
     };

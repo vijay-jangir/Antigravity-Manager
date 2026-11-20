@@ -114,12 +114,12 @@ pub fn inject_token(
     crate::modules::logger::log_info("Starting Token injection...");
 
     // 如果使用的是本项目的内置 Client ID (antigravity_enterprise 实际上是标准版)
-    // 则强制关闭 GCP TOS 标志，以确保 IDE 使用标准 Client ID 进行刷新
+    // 且未配置显式 GCP Project，则强制关闭 GCP TOS 标志，以确保 IDE 使用标准 Client ID 进行刷新
     if let Some(key) = oauth_client_key {
         if key == "antigravity_enterprise" {
-            if is_gcp_tos {
+            if is_gcp_tos && project_id.map_or(true, |pid| pid.trim().is_empty()) {
                 crate::modules::logger::log_info(
-                    "[DB] Built-in client detected, forcing Standard mode for injection.",
+                    "[DB] Built-in client detected without GCP project, forcing Standard mode for injection.",
                 );
                 is_gcp_tos = false;
             }
@@ -202,8 +202,12 @@ fn inject_new_format(
 
     inject_user_status(&conn, email)?;
 
-    if let Some(project_id) = project_id.map(str::trim).filter(|pid| !pid.is_empty()) {
-        inject_enterprise_project_preference(&conn, project_id)?;
+    if is_gcp_tos {
+        if let Some(project_id) = project_id.map(str::trim).filter(|pid| !pid.is_empty()) {
+            inject_enterprise_project_preference(&conn, project_id)?;
+        } else {
+            clear_enterprise_project_preference(&conn)?;
+        }
     } else {
         clear_enterprise_project_preference(&conn)?;
     }

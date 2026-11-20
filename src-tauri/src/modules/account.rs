@@ -1759,8 +1759,26 @@ pub fn upsert_account(
             Ok(mut account) => {
                 let old_access_token = account.token.access_token.clone();
                 let old_refresh_token = account.token.refresh_token.clone();
-                account.token = token;
-                account.name = name.clone();
+                let mut merged_token = token;
+                if merged_token.refresh_token == old_refresh_token {
+                    if merged_token.project_id.is_none() {
+                        merged_token.project_id = account.token.project_id.clone();
+                    }
+                    if merged_token.region.is_none() {
+                        merged_token.region = account.token.region.clone();
+                    }
+                    if !merged_token.is_gcp_tos && account.token.is_gcp_tos {
+                        merged_token.is_gcp_tos = true;
+                    }
+                    if merged_token.oauth_client_key.is_none() {
+                        merged_token.oauth_client_key = account.token.oauth_client_key.clone();
+                    }
+                }
+                let effective_name = name
+                    .filter(|n| !n.trim().is_empty())
+                    .or_else(|| account.name.clone());
+                account.token = merged_token;
+                account.name = effective_name.clone();
                 if account.disabled
                     && (account.token.refresh_token != old_refresh_token
                         || account.token.access_token != old_access_token)
@@ -1774,7 +1792,7 @@ pub fn upsert_account(
 
                 // 同步索引
                 if let Some(idx_summary) = index.accounts.iter_mut().find(|s| s.id == account_id) {
-                    idx_summary.name = name;
+                    idx_summary.name = effective_name;
                     idx_summary.email = account.email.clone();
                     save_account_index(&index)?;
                 }
@@ -3247,7 +3265,8 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                         .oauth_client_key
                         .clone()
                         .or_else(|| account.token.oauth_client_key.clone()),
-                );
+                )
+                .with_region(account.token.region.clone());
 
                 // Re-fetch display name
                 let name = if account.name.is_none()

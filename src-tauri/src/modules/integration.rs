@@ -440,9 +440,7 @@ impl SystemIntegration for DesktopIntegration {
     }
 }
 
-/// 辅助方法：向宿主操作系统的 Keychain/Credentials Manager 写入 Token
-pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
-    // 1. 构建 Token 的 JSON Payload，并将过期时间戳格式化为符合 RFC3339 的带微秒格式
+fn build_keyring_payload_json(account: &crate::models::Account, pretty: bool) -> Result<String, String> {
     let expiry_secs = if account.token.expiry_timestamp > 10_000_000_000 {
         account.token.expiry_timestamp / 1000
     } else {
@@ -463,22 +461,91 @@ pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Resul
     #[derive(serde::Serialize)]
     struct KeyringPayload {
         token: KeyringTokenDetails,
+        access_token: String,
+        token_type: String,
+        refresh_token: String,
+        expiry: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id_token_email: Option<String>,
         auth_method: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_tier: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tier_display_name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         id_token: Option<String>,
     }
 
-    let payload_json = serde_json::to_string(&KeyringPayload {
+    let is_gcp = (account.token.is_gcp_tos
+        || account.token.oauth_client_key.as_deref()
+            == Some(crate::modules::oauth::GCP_OAUTH_CLIENT_KEY))
+        && account
+            .token
+            .project_id
+            .as_ref()
+            .map_or(false, |p| !p.trim().is_empty());
+    let auth_method = if is_gcp { "gcp" } else { "consumer" }.to_string();
+    let gcp_project = if is_gcp {
+        account.token.project_id.clone()
+    } else {
+        None
+    };
+    let gcp_region = if is_gcp {
+        Some(
+            account
+                .token
+                .region
+                .clone()
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or_else(|| "global".to_string()),
+        )
+    } else {
+        None
+    };
+    let (user_tier, tier_display_name) = if is_gcp {
+        (
+            Some("gcp-ge-plus-tier".to_string()),
+            Some("Gemini Enterprise Plus".to_string()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let payload = KeyringPayload {
         token: KeyringTokenDetails {
             access_token: account.token.access_token.clone(),
             token_type: "Bearer".to_string(),
             refresh_token: account.token.refresh_token.clone(),
-            expiry: expiry_str,
+            expiry: expiry_str.clone(),
         },
-        auth_method: "consumer".to_string(),
+        access_token: account.token.access_token.clone(),
+        token_type: "Bearer".to_string(),
+        refresh_token: account.token.refresh_token.clone(),
+        expiry: expiry_str,
+        id_token_email: Some(account.email.clone()),
+        auth_method,
+        project_id: gcp_project,
+        region: gcp_region,
+        user_tier,
+        tier_display_name,
         id_token: account.token.id_token.clone(),
-    })
-    .map_err(|e| format!("Failed to serialize keyring JSON: {}", e))?;
+    };
+
+    if pretty {
+        serde_json::to_string_pretty(&payload)
+    } else {
+        serde_json::to_string(&payload)
+    }
+    .map_err(|e| format!("Failed to serialize keyring JSON: {}", e))
+}
+
+/// 辅助方法：向宿主操作系统的 Keychain/Credentials Manager 写入 Token
+pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
+    let payload_json = build_keyring_payload_json(account, false)?;
 
     crate::modules::logger::log_info(&format!(
         "[Desktop] Writing token to system credential store for: {}",
@@ -745,78 +812,45 @@ fn write_to_file_credentials(
         }
     }
 
-    // 1. 同步写入 Antigravity CLI (agy) 原生文件凭据: ~/.gemini/antigravity-cli/antigravity-oauth-token
-    // 兼容 SSH 会话、tmux、Docker 容器以及无 D-Bus 桌面环境
-    // [FIX #3728] 仅在切换 agy CLI 时同步写入该专属凭证，严禁经典款切号盲目覆盖破坏多端账号隔离
-    if sync_agy_cli {
-        let agy_cli_dir = gemini_dir.join("antigravity-cli");
-        if !agy_cli_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(&agy_cli_dir) {
-                crate::modules::logger::log_warn(&format!(
-                    "[Desktop] Failed to create antigravity-cli directory: {}",
-                    e
-                ));
+    // 1. 同步写入 Antigravity 原生文件凭据:
+    // - ~/.gemini/jetski-standalone-oauth-token (经典桌面端同步)
+    // - ~/.gemini/antigravity-cli/antigravity-oauth-token ([FIX #3728] 仅在切换 agy CLI 时同步写入，保障多端隔离)
+    if let Ok(agy_json_str) = build_keyring_payload_json(account, true) {
+        let mut target_paths = vec![gemini_dir.join("jetski-standalone-oauth-token")];
+        if sync_agy_cli {
+            let agy_cli_dir = gemini_dir.join("antigravity-cli");
+            if !agy_cli_dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&agy_cli_dir) {
+                    crate::modules::logger::log_warn(&format!(
+                        "[Desktop] Failed to create antigravity-cli directory: {}",
+                        e
+                    ));
+                }
             }
+            target_paths.push(agy_cli_dir.join("antigravity-oauth-token"));
         }
 
-        let expiry_secs = if account.token.expiry_timestamp > 10_000_000_000 {
-            account.token.expiry_timestamp / 1000
-        } else {
-            account.token.expiry_timestamp
-        };
-        let expiry_datetime =
-            chrono::DateTime::from_timestamp(expiry_secs, 0).unwrap_or_else(|| chrono::Utc::now());
-        let expiry_str = expiry_datetime.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-
-        #[derive(serde::Serialize)]
-        struct AgyTokenDetails {
-            access_token: String,
-            token_type: String,
-            refresh_token: String,
-            expiry: String,
-        }
-
-        #[derive(serde::Serialize)]
-        struct AgyOAuthTokenFile {
-            token: AgyTokenDetails,
-            auth_method: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            id_token: Option<String>,
-        }
-
-        let agy_token = AgyOAuthTokenFile {
-            token: AgyTokenDetails {
-                access_token: account.token.access_token.clone(),
-                token_type: "Bearer".to_string(),
-                refresh_token: account.token.refresh_token.clone(),
-                expiry: expiry_str,
-            },
-            auth_method: "consumer".to_string(),
-            id_token: account.token.id_token.clone(),
-        };
-
-        let agy_token_path = agy_cli_dir.join("antigravity-oauth-token");
-        if let Ok(agy_json_str) = serde_json::to_string_pretty(&agy_token) {
-            if let Err(e) = std::fs::write(&agy_token_path, agy_json_str) {
+        for target_path in &target_paths {
+            if let Err(e) = std::fs::write(target_path, &agy_json_str) {
                 crate::modules::logger::log_warn(&format!(
-                    "[Desktop] Failed to write antigravity-oauth-token: {}",
-                    e
+                    "[Desktop] Failed to write {:?}: {}",
+                    target_path, e
                 ));
             } else {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = std::fs::set_permissions(
-                        &agy_token_path,
+                        target_path,
                         std::fs::Permissions::from_mode(0o600),
                     );
                 }
-                crate::modules::logger::log_info(&format!(
-                    "[Desktop] Successfully synced file-based credentials to ~/.gemini/antigravity-cli/antigravity-oauth-token for: {}",
-                    account.email
-                ));
             }
         }
+        crate::modules::logger::log_info(&format!(
+            "[Desktop] Successfully synced file-based credentials for: {}",
+            account.email
+        ));
     }
 
     // 2. 同步写入 Gemini CLI 凭据 (~/.gemini/oauth_creds.json 以及 ~/.gemini/google_accounts.json)
@@ -899,15 +933,18 @@ fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAu
     let home =
         dirs::home_dir().ok_or_else(|| "Failed to resolve user home directory".to_string())?;
 
-    // 1. 优先尝试从 Antigravity CLI (agy) 原生文件凭据读取
+    // 1. 优先尝试从 Antigravity CLI (agy) / Jetski 原生文件凭据读取
     let agy_token_path = home
         .join(".gemini")
         .join("antigravity-cli")
         .join("antigravity-oauth-token");
-    if agy_token_path.exists() {
-        if let Ok(content) = fs::read_to_string(&agy_token_path) {
-            if let Ok(state) = parse_keyring_payload(&content) {
-                return Ok(state);
+    let jetski_token_path = home.join(".gemini").join("jetski-standalone-oauth-token");
+    for candidate_path in [&agy_token_path, &jetski_token_path] {
+        if candidate_path.exists() {
+            if let Ok(content) = fs::read_to_string(candidate_path) {
+                if let Ok(state) = parse_keyring_payload(&content) {
+                    return Ok(state);
+                }
             }
         }
     }
@@ -931,8 +968,9 @@ fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAu
         .to_string();
     Ok(crate::modules::migration::ImportedOAuthState {
         refresh_token,
-        is_gcp_tos: true,
+        is_gcp_tos: false,
         project_id: None,
+        region: None,
     })
 }
 
@@ -946,6 +984,7 @@ pub fn read_antigravity_cli_credentials() -> Vec<crate::modules::migration::Impo
     let cli_dir = home.join(".gemini").join("antigravity-cli");
     let candidate_files = [
         cli_dir.join("antigravity-oauth-token"),
+        home.join(".gemini").join("jetski-standalone-oauth-token"),
         cli_dir.join("antigravity-oauth-token.antigravity.bak"),
         cli_dir.join("antigravity-oauth-token.bak"),
     ];
@@ -1162,10 +1201,29 @@ fn parse_keyring_payload(
         .ok_or_else(|| "Refresh Token not found in keyring payload".to_string())?
         .to_string();
 
+    let project_id = json
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let region = json
+        .get("region")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let is_gcp_tos = json
+        .get("auth_method")
+        .and_then(|v| v.as_str())
+        .map(|m| m.eq_ignore_ascii_case("gcp"))
+        .unwrap_or_else(|| project_id.is_some());
+
     Ok(crate::modules::migration::ImportedOAuthState {
         refresh_token,
-        is_gcp_tos: true,
-        project_id: None,
+        is_gcp_tos,
+        project_id,
+        region,
     })
 }
 
@@ -1371,7 +1429,23 @@ mod tests {
         }"#;
         let state = parse_keyring_payload(payload).expect("Failed to parse nested keyring payload");
         assert_eq!(state.refresh_token, "1//test_refresh_token_123");
+        assert!(!state.is_gcp_tos);
+        assert_eq!(state.project_id, None);
+    }
+
+    #[test]
+    fn test_parse_keyring_payload_gcp_token() {
+        let payload = r#"{
+            "access_token": "ya29.test",
+            "refresh_token": "1//test_refresh_token_gcp",
+            "auth_method": "gcp",
+            "project_id": "aicode-consumers",
+            "region": "global"
+        }"#;
+        let state = parse_keyring_payload(payload).expect("Failed to parse GCP keyring payload");
+        assert_eq!(state.refresh_token, "1//test_refresh_token_gcp");
         assert!(state.is_gcp_tos);
+        assert_eq!(state.project_id.as_deref(), Some("aicode-consumers"));
     }
 
     #[test]

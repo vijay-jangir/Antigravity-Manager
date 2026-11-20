@@ -24,6 +24,9 @@ pub struct TokenData {
     pub is_gcp_tos: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+    /// Google Cloud / Vertex AI Region (e.g., "global", "us-central1") for Enterprise GCP accounts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 impl TokenData {
@@ -50,11 +53,17 @@ impl TokenData {
             session_id,
             is_gcp_tos,
             id_token,
+            region: None,
         }
     }
 
     pub fn with_oauth_client_key(mut self, oauth_client_key: Option<String>) -> Self {
         self.oauth_client_key = oauth_client_key;
+        self
+    }
+
+    pub fn with_region(mut self, region: Option<String>) -> Self {
+        self.region = region;
         self
     }
 }
